@@ -1,0 +1,1 @@
+###### I have to trace API call from PAD -Power Automate Desktop - The calls from powershell are working but exact same call run via PAD doesnt work, I have a feeling that PAD overwrite a call and reshape it / redirect it. Build me a python Tool which will insect REST API calls from my computer POST/GET - use Python for it.
