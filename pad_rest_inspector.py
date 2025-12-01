@@ -8,16 +8,24 @@ between PowerShell and Power Automate Desktop.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
+import hashlib
 import json
 import logging
+import os
+import platform
 import signal
+import ssl
+import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, List, Optional
 
 try:
-    from mitmproxy import http, options
+    from mitmproxy import certs, http, options
     from mitmproxy.tools.dump import DumpMaster
 except ModuleNotFoundError as exc:  # pragma: no cover - helps users without deps
     print(
@@ -58,6 +66,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="HTTP methods to capture (default: GET POST)",
     )
     parser.add_argument(
+        "--confdir",
+        default=str((Path.home() / ".mitmproxy").resolve()),
+        help="Where to store mitmproxy certificates (default: ~/.mitmproxy)",
+    )
+    parser.add_argument(
         "--body-bytes",
         type=int,
         default=32_768,
@@ -67,6 +80,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--verbose",
         action="store_true",
         help="Also print each captured request to stdout",
+    )
+    parser.add_argument(
+        "--no-auto-config",
+        action="store_true",
+        help="Skip automatic Windows proxy/certificate setup",
     )
     return parser.parse_args(argv)
 
@@ -122,29 +140,216 @@ class PadRestLogger:
 
 
 def run_proxy(args: argparse.Namespace) -> None:
+    asyncio.run(_run_proxy(args))
+
+
+async def _run_proxy(args: argparse.Namespace) -> None:
     opts = options.Options(
         listen_host=args.listen_host,
         listen_port=args.listen_port,
         mode="regular",
         http2=True,
+        confdir=str(Path(args.confdir).expanduser()),
     )
     master = DumpMaster(opts, with_termlog=False, with_dumper=False)
     addon = PadRestLogger(Path(args.log_file), args.methods, args.body_bytes, args.verbose)
     master.addons.add(addon)
 
+    confdir = Path(master.options.confdir or Path.home() / ".mitmproxy")
+    cert_path = ensure_ca_certificate(confdir)
+
+    auto_ctx = (
+        configure_system_proxy(args.listen_host, args.listen_port, cert_path)
+        if not args.no_auto_config
+        else contextlib.nullcontext()
+    )
+
+    loop = asyncio.get_running_loop()
+
     def _shutdown(*_sig) -> None:
         logging.info("Stopping proxy...")
         master.shutdown()
 
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _shutdown)
+        except NotImplementedError:  # Windows event loop limitation
+            signal.signal(sig, _shutdown)
 
-    logging.info(
-        "Proxy listening on http://%s:%s - remember to trust mitmproxy's certificate",
-        args.listen_host,
-        args.listen_port,
+    logging.info("Proxy listening on http://%s:%s", args.listen_host, args.listen_port)
+    with auto_ctx:
+        await master.run()
+
+
+def ensure_ca_certificate(confdir: Path) -> Path:
+    confdir = confdir.expanduser()
+    confdir.mkdir(parents=True, exist_ok=True)
+    cert_path = confdir / "mitmproxy-ca-cert.cer"
+    if cert_path.exists():
+        return cert_path
+
+    logging.info("Generating mitmproxy root CA under %s", confdir)
+    certs.CertStore.from_store(path=confdir, basename="mitmproxy", key_size=2048)
+
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if cert_path.exists():
+            return cert_path
+        time.sleep(0.2)
+    raise RuntimeError(f"Unable to create mitmproxy CA certificate at {cert_path}")
+
+
+def configure_system_proxy(host: str, port: int, cert_path: Path):
+    system = platform.system()
+    if system != "Windows":
+        logging.warning(
+            "Automatic proxy & certificate installation is currently only supported on Windows."
+        )
+        return contextlib.nullcontext()
+    return WindowsAutoConfigurator(host, port, cert_path)
+
+
+class WindowsAutoConfigurator(contextlib.AbstractContextManager["WindowsAutoConfigurator"]):
+    """Configure WinINET proxy + trust the mitmproxy CA while the proxy runs."""
+
+    REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+
+    def __init__(self, host: str, port: int, cert_path: Path) -> None:
+        self.proxy_endpoint = f"{host}:{port}"
+        self.cert_path = cert_path
+        self._env_backup: dict[str, Optional[str]] = {}
+        self._orig_enable: Optional[int] = None
+        self._orig_server: Optional[str] = None
+        self._orig_override: Optional[str] = None
+        self._thumbprint: Optional[str] = None
+
+    def __enter__(self):
+        import winreg  # type: ignore
+
+        self._env_backup = {k: os.environ.get(k) for k in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")}
+        self._orig_enable = self._query_dword(winreg, "ProxyEnable")
+        self._orig_server = self._query_string(winreg, "ProxyServer")
+        self._orig_override = self._query_string(winreg, "ProxyOverride")
+
+        self._apply_proxy(winreg)
+        self._thumbprint = install_windows_root_cert(self.cert_path)
+        self._apply_env()
+
+        logging.info("Windows proxy temporarily set to http://%s", self.proxy_endpoint)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        import winreg  # type: ignore
+
+        self._restore_proxy(winreg)
+        self._restore_env()
+        if self._thumbprint:
+            uninstall_windows_root_cert(self._thumbprint)
+        return False
+
+    def _apply_proxy(self, winreg) -> None:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, self.REG_PATH) as key:
+            winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
+            winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, self.proxy_endpoint)
+            winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, "<local>")
+        broadcast_proxy_change()
+
+    def _restore_proxy(self, winreg) -> None:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, self.REG_PATH) as key:
+            winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, int(self._orig_enable or 0))
+            if self._orig_server is None:
+                self._delete_value(winreg, key, "ProxyServer")
+            else:
+                winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, self._orig_server)
+
+            if self._orig_override is None:
+                self._delete_value(winreg, key, "ProxyOverride")
+            else:
+                winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, self._orig_override)
+        broadcast_proxy_change()
+
+    def _apply_env(self) -> None:
+        proxy = f"http://{self.proxy_endpoint}"
+        os.environ["HTTP_PROXY"] = proxy
+        os.environ["HTTPS_PROXY"] = proxy
+        os.environ.setdefault("NO_PROXY", "localhost,127.0.0.1")
+
+    def _restore_env(self) -> None:
+        for key, value in self._env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def _query_string(self, winreg, name: str) -> Optional[str]:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.REG_PATH, 0, winreg.KEY_READ) as key:
+                value, _ = winreg.QueryValueEx(key, name)
+                return str(value)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+
+    def _query_dword(self, winreg, name: str) -> Optional[int]:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.REG_PATH, 0, winreg.KEY_READ) as key:
+                value, _ = winreg.QueryValueEx(key, name)
+                return int(value)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+
+    def _delete_value(self, winreg, key, name: str) -> None:
+        try:
+            winreg.DeleteValue(key, name)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def install_windows_root_cert(cert_path: Path) -> str:
+    thumbprint = compute_thumbprint(cert_path)
+    cmd = ["certutil", "-user", "-addstore", "Root", str(cert_path)]
+    logging.info("Importing mitmproxy CA into the current user's Root store")
+    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return thumbprint
+
+
+def uninstall_windows_root_cert(thumbprint: str) -> None:
+    ps_script = (
+        "$thumb='{thumb}';"
+        "Get-ChildItem -Path Cert:\\CurrentUser\\Root | "
+        "Where-Object { $_.Thumbprint -eq $thumb } | "
+        "Remove-Item -ErrorAction SilentlyContinue"
+    ).format(thumb=thumbprint)
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command", ps_script],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    master.run()
+
+
+def broadcast_proxy_change() -> None:
+    try:
+        import ctypes
+
+        INTERNET_OPTION_SETTINGS_CHANGED = 39
+        INTERNET_OPTION_REFRESH = 37
+        wininet = ctypes.windll.Wininet  # type: ignore[attr-defined]
+        wininet.InternetSetOptionW(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
+        wininet.InternetSetOptionW(0, INTERNET_OPTION_REFRESH, 0, 0)
+    except Exception as exc:  # pragma: no cover - platform specific
+        logging.debug("Unable to broadcast proxy change: %s", exc)
+
+
+def compute_thumbprint(cert_path: Path) -> str:
+    pem = cert_path.read_text(encoding="utf-8")
+    der = ssl.PEM_cert_to_DER_cert(pem)
+    return hashlib.sha1(der).hexdigest().upper()
 
 
 if __name__ == "__main__":
