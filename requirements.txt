@@ -1,0 +1,10 @@
+# Requirements for API Interceptor Tool
+# Basic version (api_interceptor.py) - uses only standard library
+# Enhanced version (api_interceptor_mitm.py) - requires mitmproxy
+
+# For enhanced HTTPS interception support
+mitmproxy>=10.0.0
+
+# Optional: for better packet capture (alternative approach)
+# scapy>=2.5.0
+# pyshark>=0.6
