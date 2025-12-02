@@ -57,12 +57,14 @@ If you prefer a network proxy, run:
 python pad_rest_inspector.py --listen-port 8899 --verbose
 ```
 
-The script will:
+While it runs (preferably from an elevated terminal so the WinHTTP step succeeds), the script will:
 - Generate/ensure a mitmproxy root CA in `~/.mitmproxy`.
-- Temporarily configure Windows proxy settings & trust store (disable with `--no-auto-config`).
+- Install that CA into the current user’s Trusted Root store.
+- Force both WinINET **and WinHTTP** to proxy through `127.0.0.1:8899` (restored automatically when you stop the script).
+- Set `HTTP_PROXY` / `HTTPS_PROXY` environment variables so newly launched consoles inherit the proxy.
 - Log every GET/POST (configurable via `--methods`) to `pad_http_log.jsonl`.
 
-Point PAD (or system-wide `HTTP[S]_PROXY`) to `http://127.0.0.1:8899` and re-run the failing flow.
+No manual proxy tweaking is required—every HTTP(S) client (PAD, CMD, PowerShell, services) is routed through mitmproxy until you stop the script.
 
 ## Requirements
 

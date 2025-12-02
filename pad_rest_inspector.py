@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import platform
+import re
 import signal
 import ssl
 import subprocess
@@ -222,6 +223,7 @@ class WindowsAutoConfigurator(contextlib.AbstractContextManager["WindowsAutoConf
         self._orig_server: Optional[str] = None
         self._orig_override: Optional[str] = None
         self._thumbprint: Optional[str] = None
+        self._winhttp_backup: Optional[dict[str, Optional[str]]] = None
 
     def __enter__(self):
         import winreg  # type: ignore
@@ -230,8 +232,10 @@ class WindowsAutoConfigurator(contextlib.AbstractContextManager["WindowsAutoConf
         self._orig_enable = self._query_dword(winreg, "ProxyEnable")
         self._orig_server = self._query_string(winreg, "ProxyServer")
         self._orig_override = self._query_string(winreg, "ProxyOverride")
+        self._winhttp_backup = _read_winhttp_proxy()
 
         self._apply_proxy(winreg)
+        self._apply_winhttp_proxy()
         self._thumbprint = install_windows_root_cert(self.cert_path)
         self._apply_env()
 
@@ -242,6 +246,7 @@ class WindowsAutoConfigurator(contextlib.AbstractContextManager["WindowsAutoConf
         import winreg  # type: ignore
 
         self._restore_proxy(winreg)
+        self._restore_winhttp_proxy()
         self._restore_env()
         if self._thumbprint:
             uninstall_windows_root_cert(self._thumbprint)
@@ -309,6 +314,49 @@ class WindowsAutoConfigurator(contextlib.AbstractContextManager["WindowsAutoConf
         except OSError:
             pass
 
+    def _apply_winhttp_proxy(self) -> None:
+        cmd = [
+            "netsh",
+            "winhttp",
+            "set",
+            "proxy",
+            f'proxy-server="{self.proxy_endpoint}"',
+            'bypass-list="<local>"',
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            logging.info("Configured WinHTTP proxy to %s", self.proxy_endpoint)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            logging.warning("Unable to set WinHTTP proxy (requires admin?): %s", exc)
+
+    def _restore_winhttp_proxy(self) -> None:
+        backup = self._winhttp_backup
+        if not backup:
+            return
+        try:
+            if backup.get("mode") == "direct":
+                subprocess.run(
+                    ["netsh", "winhttp", "reset", "proxy"],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            elif backup.get("mode") == "proxy":
+                args = [
+                    "netsh",
+                    "winhttp",
+                    "set",
+                    "proxy",
+                    f'proxy-server="{backup.get("server", "")}"',
+                ]
+                bypass = backup.get("bypass")
+                if bypass:
+                    args.append(f'bypass-list="{bypass}"')
+                subprocess.run(args, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            logging.warning("Unable to restore WinHTTP proxy: %s", exc)
+
 
 def install_windows_root_cert(cert_path: Path) -> str:
     thumbprint = compute_thumbprint(cert_path)
@@ -350,6 +398,33 @@ def compute_thumbprint(cert_path: Path) -> str:
     pem = cert_path.read_text(encoding="utf-8")
     der = ssl.PEM_cert_to_DER_cert(pem)
     return hashlib.sha1(der).hexdigest().upper()
+
+
+def _read_winhttp_proxy() -> Optional[dict[str, Optional[str]]]:
+    try:
+        result = subprocess.run(
+            ["netsh", "winhttp", "show", "proxy"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+    output = result.stdout
+    if "Direct access (no proxy server)" in output:
+        return {"mode": "direct"}
+
+    server_match = re.search(r"Proxy Server\(s\)\s*:\s*(.+)", output)
+    bypass_match = re.search(r"Bypass List\s*:\s*(.+)", output)
+    if not server_match:
+        return {"mode": "direct"}
+    server = server_match.group(1).strip()
+    bypass = bypass_match.group(1).strip() if bypass_match else ""
+    if bypass.lower() == "(none)":
+        bypass = ""
+    return {"mode": "proxy", "server": server, "bypass": bypass}
 
 
 if __name__ == "__main__":
