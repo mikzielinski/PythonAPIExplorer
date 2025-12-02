@@ -40,16 +40,18 @@ DEFAULT_PROCESS_CANDIDATES = [
 FRIDA_AGENT = r"""
 'use strict';
 
-const WINHTTP_FLAG_SECURE = 0x00800000;
+const SECURE_FLAG = 0x00800000;
+const WINHTTP_FLAG_SECURE = SECURE_FLAG;
+const WININET_FLAG_SECURE = SECURE_FLAG;
 let callCounter = 0;
 const connectionMeta = {};
 const requestMeta = {};
 const activeRequests = {};
 
-function attachWinHttp(symbols, callbacks) {
+function attachExport(moduleName, symbols, callbacks) {
     const names = Array.isArray(symbols) ? symbols : [symbols];
     for (const name of names) {
-        const addr = Module.findExportByName('winhttp.dll', name);
+        const addr = Module.findExportByName(moduleName, name);
         if (addr) {
             Interceptor.attach(addr, callbacks);
             return true;
@@ -57,9 +59,17 @@ function attachWinHttp(symbols, callbacks) {
     }
     send({
         event: 'hook_warning',
-        info: `Unable to find winhttp export(s): ${names.join(', ')}`,
+        info: `${moduleName}: unable to find export(s): ${names.join(', ')}`,
     });
     return false;
+}
+
+function attachWinHttp(symbols, callbacks) {
+    return attachExport('winhttp.dll', symbols, callbacks);
+}
+
+function attachWinInet(symbols, callbacks) {
+    return attachExport('wininet.dll', symbols, callbacks);
 }
 
 function nextCallId() {
@@ -81,6 +91,47 @@ function safeReadUtf16(ptr) {
         send({ event: 'error', info: 'UTF16 read failed: ' + err });
         return null;
     }
+}
+
+function safeReadAnsi(ptr) {
+    if (ptr.isNull()) {
+        return null;
+    }
+    try {
+        return Memory.readCString(ptr);
+    } catch (err) {
+        send({ event: 'error', info: 'ANSI read failed: ' + err });
+        return null;
+    }
+}
+
+function readPointerString(ptr, byteLength, isWide) {
+    if (ptr.isNull()) {
+        return null;
+    }
+    try {
+        if (byteLength > 0 && byteLength !== 0xFFFFFFFF) {
+            const units = isWide ? Math.floor(byteLength / 2) : byteLength;
+            return isWide ? Memory.readUtf16String(ptr, units) : Memory.readCString(ptr, units);
+        }
+        return isWide ? Memory.readUtf16String(ptr) : Memory.readCString(ptr);
+    } catch (err) {
+        send({ event: 'error', info: 'String read failed: ' + err });
+        return null;
+    }
+}
+
+function emitHeaderLines(handle, headerBlock) {
+    if (!headerBlock) {
+        return;
+    }
+    headerBlock
+        .split(/\r?\n/)
+        .map(h => h.trim())
+        .filter(Boolean)
+        .forEach(line => {
+            send({ event: 'header', handle: handle, header: line });
+        });
 }
 
 function ensureCall(handle) {
@@ -261,6 +312,179 @@ attachWinHttp('WinHttpCloseHandle', {
             return; // close failed, skip cleanup
         }
         finishCall(this.handle, 'WinHttpCloseHandle');
+        delete connectionMeta[this.handle];
+    },
+});
+
+attachWinInet('InternetConnectW', {
+    onEnter(args) {
+        this.serverName = safeReadUtf16(args[1]) || '';
+        this.port = args[2].toInt32();
+    },
+    onLeave(retval) {
+        if (retval.isNull()) {
+            return;
+        }
+        connectionMeta[retval.toString()] = {
+            host: this.serverName,
+            port: this.port,
+        };
+    },
+});
+
+attachWinInet('InternetConnectA', {
+    onEnter(args) {
+        this.serverName = safeReadAnsi(args[1]) || '';
+        this.port = args[2].toInt32();
+    },
+    onLeave(retval) {
+        if (retval.isNull()) {
+            return;
+        }
+        connectionMeta[retval.toString()] = {
+            host: this.serverName,
+            port: this.port,
+        };
+    },
+});
+
+function hookHttpOpenRequest(isWide) {
+    return {
+        onEnter(args) {
+            this.hConnect = args[0].toString();
+            this.method = isWide ? safeReadUtf16(args[1]) : safeReadAnsi(args[1]);
+            this.path = isWide ? safeReadUtf16(args[2]) : safeReadAnsi(args[2]);
+            this.flags = args[6] ? args[6].toInt32() : 0;
+        },
+        onLeave(retval) {
+            if (retval.isNull()) {
+                return;
+            }
+            const requestHandle = retval.toString();
+            const conn = connectionMeta[this.hConnect] || {};
+            requestMeta[requestHandle] = {
+                method: this.method || 'GET',
+                path: this.path || '/',
+                host: conn.host || '',
+                port: conn.port || 0,
+                secure: (this.flags & WININET_FLAG_SECURE) !== 0,
+            };
+        },
+    };
+}
+
+attachWinInet('HttpOpenRequestW', hookHttpOpenRequest(true));
+attachWinInet('HttpOpenRequestA', hookHttpOpenRequest(false));
+
+function hookHttpSendRequest(isWide) {
+    return {
+        onEnter(args) {
+            const handle = args[0].toString();
+            ensureCall(handle);
+
+            const headerPtr = args[1];
+            const headerLen = args[2].toInt32();
+            const headerStr = readPointerString(headerPtr, headerLen, isWide);
+            emitHeaderLines(handle, headerStr);
+
+            const optionalPtr = args[3];
+            const optionalLen = args[4].toInt32();
+            if (!optionalPtr.isNull() && optionalLen > 0) {
+                const chunk = Memory.readByteArray(optionalPtr, optionalLen);
+                send({ event: 'request_body', handle: handle }, chunk);
+            }
+        },
+        onLeave(retval) {
+            if (retval.toInt32() === 0) {
+                send({ event: 'request_error', stage: 'HttpSendRequest' });
+            }
+        },
+    };
+}
+
+attachWinInet('HttpSendRequestW', hookHttpSendRequest(true));
+attachWinInet('HttpSendRequestA', hookHttpSendRequest(false));
+
+function hookHttpAddHeaders(isWide) {
+    return {
+        onEnter(args) {
+            const handle = args[0].toString();
+            ensureCall(handle);
+            const headerStr = readPointerString(args[1], args[2].toInt32(), isWide);
+            emitHeaderLines(handle, headerStr);
+        },
+    };
+}
+
+attachWinInet('HttpAddRequestHeadersW', hookHttpAddHeaders(true));
+attachWinInet('HttpAddRequestHeadersA', hookHttpAddHeaders(false));
+
+attachWinInet('InternetWriteFile', {
+    onEnter(args) {
+        this.handle = args[0].toString();
+        this.buffer = args[1];
+        this.lenRequested = args[2].toInt32();
+        this.lenPtr = args[3];
+    },
+    onLeave(retval) {
+        if (retval.toInt32() === 0) {
+            return;
+        }
+        if (!this.buffer || this.buffer.isNull()) {
+            return;
+        }
+        let size = this.lenRequested;
+        if (this.lenPtr && !this.lenPtr.isNull()) {
+            try {
+                size = Memory.readU32(this.lenPtr);
+            } catch (_) {}
+        }
+        if (size <= 0) {
+            return;
+        }
+        ensureCall(this.handle);
+        const chunk = Memory.readByteArray(this.buffer, size);
+        send({ event: 'request_body', handle: this.handle }, chunk);
+    },
+});
+
+attachWinInet('InternetReadFile', {
+    onEnter(args) {
+        this.handle = args[0].toString();
+        this.buffer = args[1];
+        this.readPtr = args[3];
+    },
+    onLeave(retval) {
+        if (retval.toInt32() === 0) {
+            return;
+        }
+        if (!this.buffer || this.buffer.isNull() || !this.readPtr || this.readPtr.isNull()) {
+            return;
+        }
+        let size = 0;
+        try {
+            size = Memory.readU32(this.readPtr);
+        } catch (e) {
+            send({ event: 'error', info: 'InternetReadFile length failed: ' + e });
+            return;
+        }
+        if (size <= 0) {
+            return;
+        }
+        const chunk = Memory.readByteArray(this.buffer, size);
+        send({ event: 'response_body', handle: this.handle }, chunk);
+    },
+});
+
+attachWinInet('InternetCloseHandle', {
+    onEnter(args) {
+        this.handle = args[0].toString();
+    },
+    onLeave(retval) {
+        if (retval.toInt32() === 0) {
+            return;
+        }
+        finishCall(this.handle, 'InternetCloseHandle');
         delete connectionMeta[this.handle];
     },
 });

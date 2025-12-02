@@ -2,7 +2,7 @@
 
 Trace every outbound call Power Automate Desktop (PAD) issues without touching proxies or TLS interception. This repository ships two complementary approaches:
 
-1. **Frida-based inline tracer** (`trace_pad_http_full.py`) — hooks WinHTTP inside `PAD.Desktop.exe`, records headers + full request/response bodies, and writes each call to `pad_full_http_logs/CALL_<n>.json`.
+1. **Frida-based inline tracer** (`trace_pad_http_full.py`) — hooks WinHTTP/WinINet inside `PAD.Desktop.exe`, records headers + full request/response bodies, and writes each call to `pad_full_http_logs/CALL_<n>.json`.
 2. **Mitmproxy-based proxy** (`pad_rest_inspector.py`) — stand up a local intercepting proxy, auto-configure Windows proxy & certificates, and log traffic at the socket boundary. Useful when you need to capture other tools besides PAD.
 
 ## Quick Start (recommended Frida tracer)
@@ -21,6 +21,7 @@ Trace every outbound call Power Automate Desktop (PAD) issues without touching p
    ```
    - Automatically uses `.pad-trace-venv` if it exists, otherwise falls back to `%PYTHON%` or the system `python`.
    - Default `--process auto` scans for `PAD.Designer.exe`, `PAD.AutomationServer.exe`, `PAD.Robot.exe`, `pad.exe`, etc. Pass `--process <name-or-pid>` if you need to target something specific.
+   - Hooks both `winhttp.dll` and `wininet.dll` (wide + ANSI exports) so you capture every PAD HTTP flow without TLS proxying.
    - Captured calls are written under `pad_full_http_logs/` with complete metadata.
 
 3. **Inspect logs**
