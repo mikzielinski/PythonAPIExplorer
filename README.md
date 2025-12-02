@@ -2,7 +2,7 @@
 
 Trace every outbound call Power Automate Desktop (PAD) issues without touching proxies or TLS interception. This repository ships two complementary approaches:
 
-1. **Frida-based inline tracer** (`trace_pad_http_full.py`) — hooks WinHTTP/WinINet inside `PAD.Desktop.exe`, records headers + full request/response bodies, and writes each call to `pad_full_http_logs/CALL_<n>.json`.
+1. **Frida-based inline tracer** (`trace_pad_http_full.py`) — hooks WinHTTP/WinINet inside every matching PAD worker (auto-rescans for child processes), records headers + full request/response bodies, and writes each call to `pad_full_http_logs/<process>_pid###_CALL_<n>.json`.
 2. **Mitmproxy-based proxy** (`pad_rest_inspector.py`) — stand up a local intercepting proxy, auto-configure Windows proxy & certificates, and log traffic at the socket boundary. Useful when you need to capture other tools besides PAD.
 
 ## Quick Start (recommended Frida tracer)
@@ -20,8 +20,8 @@ Trace every outbound call Power Automate Desktop (PAD) issues without touching p
    start_pad_trace.bat
    ```
    - Automatically uses `.pad-trace-venv` if it exists, otherwise falls back to `%PYTHON%` or the system `python`.
-   - Default `--process auto` scans for `PAD.Designer.exe`, `PAD.AutomationServer.exe`, `PAD.Robot.exe`, `pad.exe`, etc. Pass `--process <name-or-pid>` if you need to target something specific.
-   - Hooks both `winhttp.dll` and `wininet.dll` (wide + ANSI exports) so you capture every PAD HTTP flow without TLS proxying.
+   - Default `--process auto` scans for `PAD.Designer.exe`, `PAD.AutomationServer.exe`, `PAD.Robot.exe`, `pad.exe`, etc., and keeps rescanning every few seconds. Add extra names like `powershell.exe` or `cmd.exe` (e.g., `--process auto,powershell.exe,cmd.exe`) when your flows launch external tools that make HTTP calls.
+   - Hooks both `winhttp.dll` and `wininet.dll` (wide + ANSI exports) inside every attached process so you capture PAD, CMD, PowerShell, or any helper without TLS proxying.
    - Captured calls are written under `pad_full_http_logs/` with complete metadata.
 
 3. **Inspect logs**
@@ -43,9 +43,10 @@ Trace every outbound call Power Automate Desktop (PAD) issues without touching p
 
 ```text
 python trace_pad_http_full.py --help
-  --process auto            Process name or PID (or 'auto' to scan common PAD executables).
-  --log-dir pad_full_http_logs  Directory for JSON output.
-  --verbose                   Enable DEBUG logging.
+  --process auto,powershell.exe   Comma-separated names/PIDs ('auto' scans common PAD binaries).
+  --log-dir pad_full_http_logs    Directory for JSON output.
+  --rescan-seconds 3.0            How often to look for new matching processes.
+  --verbose                       Enable DEBUG logging.
 ```
 
 ## Optional: Mitmproxy capture
