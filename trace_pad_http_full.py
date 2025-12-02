@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 try:
     import frida  # type: ignore
@@ -28,6 +28,14 @@ except ModuleNotFoundError as exc:  # pragma: no cover - tool depends on frida a
         "Frida is required. Install it with `pip install frida`.\n"
         f"Original error: {exc}"
     )
+
+DEFAULT_PROCESS_CANDIDATES = [
+    "PAD.Desktop.exe",
+    "PAD.Designer.exe",
+    "PAD.AutomationServer.exe",
+    "PAD.Robot.exe",
+    "pad.exe",
+]
 
 FRIDA_AGENT = r"""
 'use strict';
@@ -310,9 +318,32 @@ class CallRecord:
         }
 
 
+def resolve_process_target(process_spec: str) -> Union[int, str]:
+    spec = (process_spec or "").strip()
+    if spec.lower() != "auto":
+        try:
+            return int(spec)
+        except ValueError:
+            return spec
+
+    device = frida.get_local_device()
+    running = {proc.name.lower(): proc for proc in device.enumerate_processes()}
+    for candidate in DEFAULT_PROCESS_CANDIDATES:
+        proc = running.get(candidate.lower())
+        if proc:
+            logging.info("Auto-detected PAD process: %s (pid %s)", proc.name, proc.pid)
+            return proc.pid
+
+    checked = ", ".join(DEFAULT_PROCESS_CANDIDATES)
+    raise SystemExit(
+        "Could not auto-detect a running PAD process. Start Power Automate Desktop "
+        f"or pass --process <name-or-pid>. Checked: {checked}"
+    )
+
+
 class PadHttpTracer:
-    def __init__(self, process_name: str, log_dir: Path) -> None:
-        self.process_name = process_name
+    def __init__(self, process_spec: str, log_dir: Path) -> None:
+        self.process_spec = process_spec
         self.log_dir = log_dir
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.calls: Dict[str, CallRecord] = {}
@@ -321,11 +352,13 @@ class PadHttpTracer:
         self._stop_event = threading.Event()
 
     def start(self) -> None:
-        logging.info("Attaching to %s", self.process_name)
+        target = resolve_process_target(self.process_spec)
+        human = f"PID {target}" if isinstance(target, int) else target
+        logging.info("Attaching to %s", human)
         try:
-            self.session = frida.attach(self.process_name)
+            self.session = frida.attach(target)
         except frida.ProcessNotFoundError:
-            raise SystemExit(f"Process '{self.process_name}' not found. Is PAD running?")
+            raise SystemExit(f"Process '{human}' not found. Is PAD running?")
 
         self.script = self.session.create_script(FRIDA_AGENT)
         self.script.on("message", self._on_message)
@@ -431,8 +464,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Trace PAD HTTP calls via Frida")
     parser.add_argument(
         "--process",
-        default="PAD.Desktop.exe",
-        help="Process name or PID to attach (default: PAD.Desktop.exe)",
+        default="auto",
+        help="Process name or PID to attach. Use 'auto' (default) to scan for PAD processes.",
     )
     parser.add_argument(
         "--log-dir",

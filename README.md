@@ -20,7 +20,7 @@ Trace every outbound call Power Automate Desktop (PAD) issues without touching p
    start_pad_trace.bat
    ```
    - Automatically uses `.pad-trace-venv` if it exists, otherwise falls back to `%PYTHON%` or the system `python`.
-   - Hooks into `PAD.Desktop.exe` (change with `--process <name-or-pid>` if needed).
+   - Default `--process auto` scans for `PAD.Designer.exe`, `PAD.AutomationServer.exe`, `PAD.Robot.exe`, `pad.exe`, etc. Pass `--process <name-or-pid>` if you need to target something specific.
    - Captured calls are written under `pad_full_http_logs/` with complete metadata.
 
 3. **Inspect logs**
@@ -42,7 +42,7 @@ Trace every outbound call Power Automate Desktop (PAD) issues without touching p
 
 ```text
 python trace_pad_http_full.py --help
-  --process PAD.Desktop.exe   Process name or PID to attach to.
+  --process auto            Process name or PID (or 'auto' to scan common PAD executables).
   --log-dir pad_full_http_logs  Directory for JSON output.
   --verbose                   Enable DEBUG logging.
 ```
