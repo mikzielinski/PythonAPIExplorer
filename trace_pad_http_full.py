@@ -46,6 +46,22 @@ const connectionMeta = {};
 const requestMeta = {};
 const activeRequests = {};
 
+function attachWinHttp(symbols, callbacks) {
+    const names = Array.isArray(symbols) ? symbols : [symbols];
+    for (const name of names) {
+        const addr = Module.findExportByName('winhttp.dll', name);
+        if (addr) {
+            Interceptor.attach(addr, callbacks);
+            return true;
+        }
+    }
+    send({
+        event: 'hook_warning',
+        info: `Unable to find winhttp export(s): ${names.join(', ')}`,
+    });
+    return false;
+}
+
 function nextCallId() {
     callCounter += 1;
     return `CALL_${callCounter}`;
@@ -97,7 +113,7 @@ function finishCall(handle, reason) {
     delete requestMeta[handle];
 }
 
-Interceptor.attach(Module.getExportByName('winhttp.dll', 'WinHttpConnect'), {
+attachWinHttp('WinHttpConnect', {
     onEnter(args) {
         this.serverName = safeReadUtf16(args[1]) || '';
         this.port = args[2].toInt32();
@@ -113,7 +129,7 @@ Interceptor.attach(Module.getExportByName('winhttp.dll', 'WinHttpConnect'), {
     },
 });
 
-Interceptor.attach(Module.getExportByName('winhttp.dll', 'WinHttpOpenRequest'), {
+attachWinHttp('WinHttpOpenRequest', {
     onEnter(args) {
         this.hConnect = args[0].toString();
         this.method = safeReadUtf16(args[1]) || 'GET';
@@ -136,7 +152,7 @@ Interceptor.attach(Module.getExportByName('winhttp.dll', 'WinHttpOpenRequest'), 
     },
 });
 
-Interceptor.attach(Module.getExportByName('winhttp.dll', 'WinHttpSendRequest'), {
+attachWinHttp('WinHttpSendRequest', {
     onEnter(args) {
         const handle = args[0].toString();
         ensureCall(handle);
@@ -155,7 +171,7 @@ Interceptor.attach(Module.getExportByName('winhttp.dll', 'WinHttpSendRequest'), 
     },
 });
 
-Interceptor.attach(Module.getExportByName('winhttp.dll', 'WinHttpAddRequestHeadersW'), {
+attachWinHttp(['WinHttpAddRequestHeadersW', 'WinHttpAddRequestHeaders'], {
     onEnter(args) {
         const handle = args[0].toString();
         ensureCall(handle);
@@ -166,7 +182,7 @@ Interceptor.attach(Module.getExportByName('winhttp.dll', 'WinHttpAddRequestHeade
     },
 });
 
-Interceptor.attach(Module.getExportByName('winhttp.dll', 'WinHttpWriteData'), {
+attachWinHttp('WinHttpWriteData', {
     onEnter(args) {
         this.handle = args[0].toString();
         this.buffer = args[1];
@@ -195,7 +211,7 @@ Interceptor.attach(Module.getExportByName('winhttp.dll', 'WinHttpWriteData'), {
     },
 });
 
-Interceptor.attach(Module.getExportByName('winhttp.dll', 'WinHttpReceiveResponse'), {
+attachWinHttp('WinHttpReceiveResponse', {
     onEnter(args) {
         this.handle = args[0].toString();
     },
@@ -208,7 +224,7 @@ Interceptor.attach(Module.getExportByName('winhttp.dll', 'WinHttpReceiveResponse
     },
 });
 
-Interceptor.attach(Module.getExportByName('winhttp.dll', 'WinHttpReadData'), {
+attachWinHttp('WinHttpReadData', {
     onEnter(args) {
         this.handle = args[0].toString();
         this.buffer = args[1];
@@ -236,7 +252,7 @@ Interceptor.attach(Module.getExportByName('winhttp.dll', 'WinHttpReadData'), {
     },
 });
 
-Interceptor.attach(Module.getExportByName('winhttp.dll', 'WinHttpCloseHandle'), {
+attachWinHttp('WinHttpCloseHandle', {
     onEnter(args) {
         this.handle = args[0].toString();
     },
@@ -441,6 +457,8 @@ class PadHttpTracer:
             logging.warning("Request error: %s", payload.get("stage"))
         elif event == "error":
             logging.warning("Agent error: %s", payload.get("info"))
+        elif event == "hook_warning":
+            logging.warning("Hook warning: %s", payload.get("info"))
         else:
             logging.debug("Unhandled event: %s", payload)
 
