@@ -1,40 +1,39 @@
 #!/usr/bin/env python3
-"""Trace every WinHTTP request PAD generates using Frida.
+"""Trace every WinHTTP/WinINet request PAD (and spawned tools) issue using Frida.
 
-This script injects a Frida agent into PAD.Desktop.exe (or any process name you
-pass in), hooks WinHTTP entry points, and streams every request/response body
-and header into JSON files under the chosen log directory. No proxying or TLS
-interception is required because we capture traffic directly inside the
-application before encryption.
+This tool can attach to multiple processes at once, continually rescans for new
+Power Automate Desktop workers, and captures complete request/response payloads
+without forcing TLS interception.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import json
 import logging
 import signal
-import sys
 import threading
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
 try:
     import frida  # type: ignore
-except ModuleNotFoundError as exc:  # pragma: no cover - tool depends on frida at runtime
+except ModuleNotFoundError as exc:  # pragma: no cover - runtime dependency
     raise SystemExit(
         "Frida is required. Install it with `pip install frida`.\n"
         f"Original error: {exc}"
     )
 
-DEFAULT_PROCESS_CANDIDATES = [
-    "PAD.Desktop.exe",
-    "PAD.Designer.exe",
-    "PAD.AutomationServer.exe",
-    "PAD.Robot.exe",
-    "pad.exe",
+DEFAULT_PROCESS_PATTERNS = [
+    "pad.desktop.exe",
+    "pad.designer.exe",
+    "pad.automationserver.exe",
+    "pad.automationservice.exe",
+    "pad.robot.exe",
+    "pad.robotservice.exe",
+    "pad.*",
 ]
 
 FRIDA_AGENT = r"""
@@ -48,6 +47,11 @@ const connectionMeta = {};
 const requestMeta = {};
 const activeRequests = {};
 
+function sendEvent(payload, data) {
+    payload.pid = Process.id;
+    send(payload, data);
+}
+
 function attachExport(moduleName, symbols, callbacks) {
     const names = Array.isArray(symbols) ? symbols : [symbols];
     for (const name of names) {
@@ -57,7 +61,7 @@ function attachExport(moduleName, symbols, callbacks) {
             return true;
         }
     }
-    send({
+    sendEvent({
         event: 'hook_warning',
         info: `${moduleName}: unable to find export(s): ${names.join(', ')}`,
     });
@@ -88,7 +92,7 @@ function safeReadUtf16(ptr) {
     try {
         return Memory.readUtf16String(ptr);
     } catch (err) {
-        send({ event: 'error', info: 'UTF16 read failed: ' + err });
+        sendEvent({ event: 'error', info: 'UTF16 read failed: ' + err });
         return null;
     }
 }
@@ -100,7 +104,7 @@ function safeReadAnsi(ptr) {
     try {
         return Memory.readCString(ptr);
     } catch (err) {
-        send({ event: 'error', info: 'ANSI read failed: ' + err });
+        sendEvent({ event: 'error', info: 'ANSI read failed: ' + err });
         return null;
     }
 }
@@ -116,7 +120,7 @@ function readPointerString(ptr, byteLength, isWide) {
         }
         return isWide ? Memory.readUtf16String(ptr) : Memory.readCString(ptr);
     } catch (err) {
-        send({ event: 'error', info: 'String read failed: ' + err });
+        sendEvent({ event: 'error', info: 'String read failed: ' + err });
         return null;
     }
 }
@@ -130,7 +134,7 @@ function emitHeaderLines(handle, headerBlock) {
         .map(h => h.trim())
         .filter(Boolean)
         .forEach(line => {
-            send({ event: 'header', handle: handle, header: line });
+            sendEvent({ event: 'header', handle: handle, header: line });
         });
 }
 
@@ -141,7 +145,7 @@ function ensureCall(handle) {
     const meta = requestMeta[handle] || {};
     const id = nextCallId();
     activeRequests[handle] = { id: id, handle: handle };
-    send({
+    sendEvent({
         event: 'request_start',
         id: id,
         handle: handle,
@@ -159,7 +163,7 @@ function finishCall(handle, reason) {
     if (!activeRequests[handle]) {
         return;
     }
-    send({ event: 'request_end', handle: handle, reason: reason || 'WinHttpCloseHandle' });
+    sendEvent({ event: 'request_end', handle: handle, reason: reason || 'CloseHandle' });
     delete activeRequests[handle];
     delete requestMeta[handle];
 }
@@ -212,12 +216,12 @@ attachWinHttp('WinHttpSendRequest', {
         const optionalLen = args[5].toInt32();
         if (!lpOptional.isNull() && optionalLen > 0) {
             const chunk = Memory.readByteArray(lpOptional, optionalLen);
-            send({ event: 'request_body', handle: handle }, chunk);
+            sendEvent({ event: 'request_body', handle: handle }, chunk);
         }
     },
     onLeave(retval) {
         if (retval.toInt32() === 0) {
-            send({ event: 'request_error', stage: 'WinHttpSendRequest' });
+            sendEvent({ event: 'request_error', stage: 'WinHttpSendRequest' });
         }
     },
 });
@@ -228,7 +232,7 @@ attachWinHttp(['WinHttpAddRequestHeadersW', 'WinHttpAddRequestHeaders'], {
         ensureCall(handle);
         const header = safeReadUtf16(args[1]);
         if (header) {
-            send({ event: 'header', handle: handle, header: header });
+            sendEvent({ event: 'header', handle: handle, header: header });
         }
     },
 });
@@ -258,7 +262,7 @@ attachWinHttp('WinHttpWriteData', {
         }
         ensureCall(this.handle);
         const chunk = Memory.readByteArray(this.buffer, size);
-        send({ event: 'request_body', handle: this.handle }, chunk);
+        sendEvent({ event: 'request_body', handle: this.handle }, chunk);
     },
 });
 
@@ -271,7 +275,7 @@ attachWinHttp('WinHttpReceiveResponse', {
             return;
         }
         ensureCall(this.handle);
-        send({ event: 'response_start', handle: this.handle });
+        sendEvent({ event: 'response_start', handle: this.handle });
     },
 });
 
@@ -292,14 +296,14 @@ attachWinHttp('WinHttpReadData', {
         try {
             size = Memory.readU32(this.readPtr);
         } catch (e) {
-            send({ event: 'error', info: 'ReadData length failed: ' + e });
+            sendEvent({ event: 'error', info: 'WinHttpReadData length failed: ' + e });
             return;
         }
         if (size <= 0) {
             return;
         }
         const chunk = Memory.readByteArray(this.buffer, size);
-        send({ event: 'response_body', handle: this.handle }, chunk);
+        sendEvent({ event: 'response_body', handle: this.handle }, chunk);
     },
 });
 
@@ -309,13 +313,14 @@ attachWinHttp('WinHttpCloseHandle', {
     },
     onLeave(retval) {
         if (retval.toInt32() === 0) {
-            return; // close failed, skip cleanup
+            return;
         }
         finishCall(this.handle, 'WinHttpCloseHandle');
         delete connectionMeta[this.handle];
     },
 });
 
+/* WinINet coverage for cmd.exe / powershell.exe REST helpers */
 attachWinInet('InternetConnectW', {
     onEnter(args) {
         this.serverName = safeReadUtf16(args[1]) || '';
@@ -391,12 +396,12 @@ function hookHttpSendRequest(isWide) {
             const optionalLen = args[4].toInt32();
             if (!optionalPtr.isNull() && optionalLen > 0) {
                 const chunk = Memory.readByteArray(optionalPtr, optionalLen);
-                send({ event: 'request_body', handle: handle }, chunk);
+                sendEvent({ event: 'request_body', handle: handle }, chunk);
             }
         },
         onLeave(retval) {
             if (retval.toInt32() === 0) {
-                send({ event: 'request_error', stage: 'HttpSendRequest' });
+                sendEvent({ event: 'request_error', stage: 'HttpSendRequest' });
             }
         },
     };
@@ -444,7 +449,7 @@ attachWinInet('InternetWriteFile', {
         }
         ensureCall(this.handle);
         const chunk = Memory.readByteArray(this.buffer, size);
-        send({ event: 'request_body', handle: this.handle }, chunk);
+        sendEvent({ event: 'request_body', handle: this.handle }, chunk);
     },
 });
 
@@ -465,14 +470,14 @@ attachWinInet('InternetReadFile', {
         try {
             size = Memory.readU32(this.readPtr);
         } catch (e) {
-            send({ event: 'error', info: 'InternetReadFile length failed: ' + e });
+            sendEvent({ event: 'error', info: 'InternetReadFile length failed: ' + e });
             return;
         }
         if (size <= 0) {
             return;
         }
         const chunk = Memory.readByteArray(this.buffer, size);
-        send({ event: 'response_body', handle: this.handle }, chunk);
+        sendEvent({ event: 'response_body', handle: this.handle }, chunk);
     },
 });
 
@@ -489,6 +494,19 @@ attachWinInet('InternetCloseHandle', {
     },
 });
 """
+
+
+@dataclass(frozen=True)
+class TargetProcess:
+    pid: int
+    name: str
+
+
+@dataclass
+class TracerSession:
+    target: TargetProcess
+    session: frida.core.Session  # type: ignore[name-defined]
+    script: frida.core.Script  # type: ignore[name-defined]
 
 
 @dataclass
@@ -530,6 +548,8 @@ class BodyCapture:
 class CallRecord:
     identifier: str
     handle: str
+    pid: int
+    process_name: str
     timestamp: str
     method: str
     host: str
@@ -542,12 +562,15 @@ class CallRecord:
 
     def url(self) -> str:
         scheme = "https" if self.secure else "http"
-        port_suffix = "" if (self.port == 0 or (self.secure and self.port == 443) or (not self.secure and self.port == 80)) else f":{self.port}"
+        default_port = 443 if self.secure else 80
+        port_suffix = "" if (self.port in (0, default_port)) else f":{self.port}"
         return f"{scheme}://{self.host}{port_suffix}{self.path}" if self.host else self.path
 
     def to_json(self) -> Dict[str, object]:
         return {
             "id": self.identifier,
+            "pid": self.pid,
+            "process": self.process_name,
             "timestamp": self.timestamp,
             "url": self.url(),
             "method": self.method,
@@ -558,52 +581,79 @@ class CallRecord:
         }
 
 
-def resolve_process_target(process_spec: str) -> Union[int, str]:
-    spec = (process_spec or "").strip()
-    if spec.lower() != "auto":
-        try:
-            return int(spec)
-        except ValueError:
-            return spec
+def sanitize_filename(name: str) -> str:
+    safe = [c if c.isalnum() or c in ("-", "_") else "_" for c in name]
+    return "".join(safe) or "process"
 
-    device = frida.get_local_device()
-    running = {proc.name.lower(): proc for proc in device.enumerate_processes()}
-    for candidate in DEFAULT_PROCESS_CANDIDATES:
-        proc = running.get(candidate.lower())
-        if proc:
-            logging.info("Auto-detected PAD process: %s (pid %s)", proc.name, proc.pid)
-            return proc.pid
 
-    checked = ", ".join(DEFAULT_PROCESS_CANDIDATES)
-    raise SystemExit(
-        "Could not auto-detect a running PAD process. Start Power Automate Desktop "
-        f"or pass --process <name-or-pid>. Checked: {checked}"
-    )
+def parse_process_tokens(spec: str) -> List[str]:
+    raw = spec or "auto"
+    tokens = [token.strip().lower() for token in raw.split(",") if token.strip()]
+    return tokens or ["auto"]
+
+
+def matches_name(token: str, candidate: str) -> bool:
+    if token == "*":
+        return True
+    if token.endswith("*"):
+        return candidate.startswith(token[:-1])
+    return candidate == token
+
+
+def find_matching_processes(device: frida.core.Device, tokens: List[str]) -> List[TargetProcess]:  # type: ignore[name-defined]
+    running = device.enumerate_processes()
+    by_name: Dict[str, List[frida.core.Process]] = {}  # type: ignore[name-defined]
+    for proc in running:
+        by_name.setdefault(proc.name.lower(), []).append(proc)
+
+    matches: Dict[int, TargetProcess] = {}
+    for token in tokens:
+        if token == "auto":
+            for pattern in DEFAULT_PROCESS_PATTERNS:
+                _collect_matches(pattern, by_name, matches)
+            continue
+        if token.isdigit():
+            pid = int(token)
+            proc = next((p for p in running if p.pid == pid), None)
+            name = proc.name if proc else f"pid:{pid}"
+            matches.setdefault(pid, TargetProcess(pid=pid, name=name))
+            continue
+        _collect_matches(token, by_name, matches)
+
+    return list(matches.values())
+
+
+def _collect_matches(pattern: str, by_name: Dict[str, List[frida.core.Process]], matches: Dict[int, TargetProcess]) -> None:  # type: ignore[name-defined]
+    if pattern.endswith("*"):
+        prefix = pattern[:-1]
+        for name, procs in by_name.items():
+            if name.startswith(prefix):
+                for proc in procs:
+                    matches.setdefault(proc.pid, TargetProcess(pid=proc.pid, name=proc.name))
+        return
+
+    for proc in by_name.get(pattern, []):
+        matches.setdefault(proc.pid, TargetProcess(pid=proc.pid, name=proc.name))
 
 
 class PadHttpTracer:
-    def __init__(self, process_spec: str, log_dir: Path) -> None:
-        self.process_spec = process_spec
+    def __init__(self, process_spec: str, log_dir: Path, rescan_seconds: float) -> None:
+        self.process_tokens = parse_process_tokens(process_spec)
         self.log_dir = log_dir
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.rescan_seconds = max(0.5, rescan_seconds)
         self.calls: Dict[str, CallRecord] = {}
-        self.session: Optional[frida.core.Session] = None
-        self.script = None
+        self.device = frida.get_local_device()
+        self.sessions: Dict[int, TracerSession] = {}
         self._stop_event = threading.Event()
+        self._watch_thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
-        target = resolve_process_target(self.process_spec)
-        human = f"PID {target}" if isinstance(target, int) else target
-        logging.info("Attaching to %s", human)
-        try:
-            self.session = frida.attach(target)
-        except frida.ProcessNotFoundError:
-            raise SystemExit(f"Process '{human}' not found. Is PAD running?")
-
-        self.script = self.session.create_script(FRIDA_AGENT)
-        self.script.on("message", self._on_message)
-        self.script.load()
-
+        self._attach_new_targets(initial=True)
+        if not self.sessions:
+            logging.warning("No matching processes yet. Waiting for them to start ...")
+        self._watch_thread = threading.Thread(target=self._watch_loop, daemon=True)
+        self._watch_thread.start()
         logging.info("Hook active. Press Ctrl+C to stop.")
         self._stop_event.wait()
         self._cleanup()
@@ -611,40 +661,70 @@ class PadHttpTracer:
     def stop(self) -> None:
         self._stop_event.set()
 
+    def _watch_loop(self) -> None:
+        while not self._stop_event.wait(self.rescan_seconds):
+            self._attach_new_targets()
+
+    def _attach_new_targets(self, initial: bool = False) -> None:
+        targets = find_matching_processes(self.device, self.process_tokens)
+        new_targets = [t for t in targets if t.pid not in self.sessions]
+        if initial and not new_targets:
+            logging.debug("No initial process matches for %s", self.process_tokens)
+        for target in new_targets:
+            self._attach_to_target(target)
+
+    def _attach_to_target(self, target: TargetProcess) -> None:
+        try:
+            session = self.device.attach(target.pid)
+        except frida.ProcessNotFoundError:
+            logging.warning("Process %s (pid %s) disappeared before attach", target.name, target.pid)
+            return
+
+        script = session.create_script(FRIDA_AGENT)
+        script.on("message", functools.partial(self._on_message, target))
+        script.load()
+
+        self.sessions[target.pid] = TracerSession(target=target, session=session, script=script)
+        logging.info("Attached to %s (pid %s)", target.name, target.pid)
+
     def _cleanup(self) -> None:
-        if self.script is not None:
+        for session in list(self.sessions.values()):
             try:
-                self.script.unload()
+                session.script.unload()
             except frida.InvalidOperationError:
                 pass
-            self.script = None
-        if self.session is not None:
             try:
-                self.session.detach()
+                session.session.detach()
             except frida.InvalidOperationError:
                 pass
-            self.session = None
+        self.sessions.clear()
+        if self._watch_thread:
+            self._watch_thread.join(timeout=1)
         self._flush_open_calls()
 
     def _flush_open_calls(self) -> None:
-        for handle, record in list(self.calls.items()):
-            logging.info("Flushing incomplete call %s (%s)", record.identifier, handle)
+        for key, record in list(self.calls.items()):
+            logging.info("Flushing incomplete call %s from %s", record.identifier, record.process_name)
             self._save_call(record, reason="forced_shutdown")
-            del self.calls[handle]
+            del self.calls[key]
 
-    def _on_message(self, message, data) -> None:
+    def _on_message(self, target: TargetProcess, message, data) -> None:
         if message["type"] != "send":
-            logging.error("FRIDA: %s", message)
+            logging.error("FRIDA (%s:%s): %s", target.name, target.pid, message)
             return
 
         payload = message["payload"]
         event = payload.get("event")
         handle = payload.get("handle")
+        pid = int(payload.get("pid", target.pid))
+        key = f"{pid}:{handle}" if handle else None
 
-        if event == "request_start":
+        if event == "request_start" and key:
             record = CallRecord(
                 identifier=payload["id"],
                 handle=handle,
+                pid=pid,
+                process_name=target.name,
                 timestamp=payload.get("timestamp", ""),
                 method=payload.get("method", "UNKNOWN"),
                 host=payload.get("host", ""),
@@ -652,45 +732,44 @@ class PadHttpTracer:
                 path=payload.get("path", "/"),
                 secure=bool(payload.get("secure", False)),
             )
-            self.calls[handle] = record
-            logging.info("[%s] %s %s", record.identifier, record.method, record.url())
-        elif event == "header":
-            record = self.calls.get(handle)
+            self.calls[key] = record
+            logging.info("[%s:%s] %s %s", target.name, pid, record.method, record.url())
+        elif event == "header" and key:
+            record = self.calls.get(key)
             if record:
                 record.headers.append(payload.get("header", ""))
-                logging.debug("[%s] Header: %s", record.identifier, payload.get("header"))
-        elif event == "request_body":
-            record = self.calls.get(handle)
+        elif event == "request_body" and key:
+            record = self.calls.get(key)
             if record and data:
                 record.request_body.append(data)
-                logging.debug("[%s] Request chunk %d bytes", record.identifier, len(data))
-        elif event == "response_body":
-            record = self.calls.get(handle)
+        elif event == "response_body" and key:
+            record = self.calls.get(key)
             if record and data:
                 record.response_body.append(data)
-                logging.debug("[%s] Response chunk %d bytes", record.identifier, len(data))
-        elif event == "response_start":
-            record = self.calls.get(handle)
+        elif event == "response_start" and key:
+            record = self.calls.get(key)
             if record:
-                logging.debug("[%s] Response started", record.identifier)
-        elif event == "request_end":
-            record = self.calls.pop(handle, None)
+                logging.debug("[%s:%s] Response started", record.process_name, record.pid)
+        elif event == "request_end" and key:
+            record = self.calls.pop(key, None)
             if record:
                 self._save_call(record, reason=payload.get("reason"))
         elif event == "request_error":
-            logging.warning("Request error: %s", payload.get("stage"))
+            logging.warning("Request error (%s:%s): %s", target.name, pid, payload.get("stage"))
         elif event == "error":
-            logging.warning("Agent error: %s", payload.get("info"))
+            logging.warning("Agent error (%s:%s): %s", target.name, pid, payload.get("info"))
         elif event == "hook_warning":
-            logging.warning("Hook warning: %s", payload.get("info"))
+            logging.debug("(%s:%s) %s", target.name, pid, payload.get("info"))
         else:
-            logging.debug("Unhandled event: %s", payload)
+            logging.debug("Unhandled event from %s:%s -> %s", target.name, pid, payload)
 
     def _save_call(self, record: CallRecord, reason: Optional[str] = None) -> None:
         doc = record.to_json()
         if reason:
             doc["completed_by"] = reason
-        path = self.log_dir / f"{record.identifier}.json"
+        safe_name = sanitize_filename(record.process_name)
+        filename = f"{safe_name}_pid{record.pid}_{record.identifier}.json"
+        path = self.log_dir / filename
         with path.open("w", encoding="utf-8") as fh:
             json.dump(doc, fh, indent=2, ensure_ascii=False)
         logging.info(
@@ -707,13 +786,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--process",
         default="auto",
-        help="Process name or PID to attach. Use 'auto' (default) to scan for PAD processes.",
+        help=(
+            "Comma-separated list of process names/pids. Use 'auto' to watch common "
+            "PAD executables (default). Examples: --process auto,powershell.exe"
+        ),
     )
     parser.add_argument(
         "--log-dir",
         default="pad_full_http_logs",
         type=Path,
         help="Directory where call JSON files will be written",
+    )
+    parser.add_argument(
+        "--rescan-seconds",
+        type=float,
+        default=3.0,
+        help="How often to rescan for new matching processes (default: 3.0 seconds)",
     )
     parser.add_argument(
         "--verbose",
@@ -739,15 +827,14 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    tracer = PadHttpTracer(str(args.process), Path(args.log_dir))
+    tracer = PadHttpTracer(str(args.process), Path(args.log_dir), args.rescan_seconds)
     install_signal_handlers(tracer)
     try:
         tracer.start()
     except KeyboardInterrupt:
-        tracer.stop()
+            tracer.stop()
     except frida.TransportError as exc:
         logging.error("Frida transport error: %s", exc)
-    finally:
         tracer.stop()
 
 
