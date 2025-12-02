@@ -148,7 +148,7 @@ async def _run_proxy(args: argparse.Namespace) -> None:
     opts = options.Options(
         listen_host=args.listen_host,
         listen_port=args.listen_port,
-        mode="regular",
+        mode=["regular"],
         http2=True,
         confdir=str(Path(args.confdir).expanduser()),
     )
