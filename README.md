@@ -54,7 +54,7 @@ python trace_pad_http_full.py --help
 If you prefer a network proxy, run:
 
 ```bash
-python pad_rest_inspector.py --listen-port 8899 --verbose
+start_pad_proxy.bat --listen-port 8899 --verbose
 ```
 
 While it runs (preferably from an elevated terminal so the WinHTTP step succeeds), the script will:
@@ -64,7 +64,7 @@ While it runs (preferably from an elevated terminal so the WinHTTP step succeeds
 - Set `HTTP_PROXY` / `HTTPS_PROXY` environment variables so newly launched consoles inherit the proxy.
 - Log every GET/POST (configurable via `--methods`) to `pad_http_log.jsonl`.
 
-No manual proxy tweaking is required—every HTTP(S) client (PAD, CMD, PowerShell, services) is routed through mitmproxy until you stop the script.
+No manual proxy tweaking is required—every HTTP(S) client (PAD, CMD, PowerShell, services) is routed through mitmproxy until you stop the script. All captured details (headers + bodies up to `--body-bytes`) are appended to `pad_http_log.jsonl`.
 
 ## Requirements
 
