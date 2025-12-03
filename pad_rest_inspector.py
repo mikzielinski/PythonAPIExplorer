@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
@@ -112,12 +113,10 @@ class PadRestLogger:
             "method": method,
             "url": flow.request.pretty_url,
             "request_headers": dict(flow.request.headers),
-            "request_body": self._truncate(flow.request.get_text(strict=False)),
+            "request_body": self._format_body(flow.request.raw_content),
             "status_code": flow.response.status_code if flow.response else None,
             "response_headers": dict(flow.response.headers) if flow.response else None,
-            "response_body": self._truncate(flow.response.get_text(strict=False))
-            if flow.response
-            else None,
+            "response_body": self._format_body(flow.response.raw_content if flow.response else None),
         }
 
         json.dump(entry, self._fh)
@@ -130,14 +129,35 @@ class PadRestLogger:
     def done(self):  # pragma: no cover - invoked by mitmproxy
         self._fh.close()
 
-    def _truncate(self, payload: Optional[str]) -> Optional[str]:
-        if payload is None:
-            return None
-        if self.body_limit == 0:
-            return ""
-        if len(payload) <= self.body_limit:
-            return payload
-        return payload[: self.body_limit] + "... <truncated>"
+    def _format_body(self, raw: Optional[bytes]) -> dict[str, object]:
+        if raw is None:
+            return {"text": "", "base64": "", "size_bytes": 0, "encoding": "utf-8", "truncated": False}
+
+        body = raw
+        truncated = False
+        if self.body_limit > 0 and len(raw) > self.body_limit:
+            body = raw[: self.body_limit]
+            truncated = True
+
+        text: Optional[str]
+        encoding = "utf-8"
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                text = body.decode("latin-1")
+                encoding = "latin-1"
+            except UnicodeDecodeError:
+                text = None
+                encoding = "binary"
+
+        return {
+            "text": text or "",
+            "base64": base64.b64encode(body).decode("ascii"),
+            "size_bytes": len(raw),
+            "encoding": encoding,
+            "truncated": truncated,
+        }
 
 
 def run_proxy(args: argparse.Namespace) -> None:

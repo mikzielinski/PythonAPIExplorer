@@ -33,8 +33,20 @@ Trace every outbound call Power Automate Desktop (PAD) issues without touching p
      "url": "https://api.example.com/invoice",
      "method": "POST",
      "headers": ["Content-Type: application/json", "Authorization: Bearer ..."],
-     "request_body": {"text": "{...}", "base64": "...", "size_bytes": 512, "encoding": "utf-8"},
-     "response_body": {...}
+    "request_body": {
+      "text": "{\"invoice\":123,...}",
+      "base64": "eyJpbnZvaWNlIjoxMjMsLi4ufQ==",
+      "size_bytes": 265,
+      "encoding": "utf-8",
+      "truncated": false
+    },
+    "response_body": {
+      "text": "{\"status\":\"OK\",\"id\":\"9876\"}",
+      "base64": "eyJzdGF0dXMiOiJPSyIsImlkIjoiOTg3NiJ9",
+      "size_bytes": 64,
+      "encoding": "utf-8",
+      "truncated": false
+    }
    }
    ```
    Compare these files directly against your PowerShell calls to spot PAD rewrites.
