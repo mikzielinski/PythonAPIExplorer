@@ -368,11 +368,11 @@ def install_windows_root_cert(cert_path: Path) -> str:
 
 def uninstall_windows_root_cert(thumbprint: str) -> None:
     ps_script = (
-        "$thumb='{thumb}';"
+        f"$thumb='{thumbprint}';"
         "Get-ChildItem -Path Cert:\\CurrentUser\\Root | "
-        "Where-Object { $_.Thumbprint -eq $thumb } | "
+        "Where-Object {{ $_.Thumbprint -eq $thumb }} | "
         "Remove-Item -ErrorAction SilentlyContinue"
-    ).format(thumb=thumbprint)
+    )
     subprocess.run(
         ["powershell", "-NoProfile", "-Command", ps_script],
         check=False,
