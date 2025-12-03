@@ -679,6 +679,12 @@ class PadHttpTracer:
         except frida.ProcessNotFoundError:
             logging.warning("Process %s (pid %s) disappeared before attach", target.name, target.pid)
             return
+        except frida.ProcessNotRespondingError:
+            logging.warning("Process %s (pid %s) refused injection; skipping", target.name, target.pid)
+            return
+        except frida.PermissionDeniedError:
+            logging.warning("Permission denied attaching to %s (pid %s). Run as admin?", target.name, target.pid)
+            return
 
         script = session.create_script(FRIDA_AGENT)
         script.on("message", functools.partial(self._on_message, target))
