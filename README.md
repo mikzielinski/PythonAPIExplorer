@@ -64,7 +64,7 @@ While it runs (preferably from an elevated terminal so the WinHTTP step succeeds
 - Set `HTTP_PROXY` / `HTTPS_PROXY` environment variables so newly launched consoles inherit the proxy.
 - Log every GET/POST (configurable via `--methods`) to `pad_http_log.jsonl`.
 
-No manual proxy tweaking is required—every HTTP(S) client (PAD, CMD, PowerShell, services) is routed through mitmproxy until you stop the script. All captured details (headers + bodies up to `--body-bytes`) are appended to `pad_http_log.jsonl`.
+No manual proxy tweaking is required—every HTTP(S) client (PAD, CMD, PowerShell, services) is routed through mitmproxy until you stop the script. When the batch file exits it also runs a best-effort cleanup (`netsh winhttp reset proxy`, disable WinINET proxy, clear `HTTP[S]_PROXY`) to guarantee proxies are off even if the Python process was interrupted. All captured details (headers + bodies up to `--body-bytes`) are appended to `pad_http_log.jsonl`.
 
 ## Requirements
 
