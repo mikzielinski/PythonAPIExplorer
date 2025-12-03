@@ -20,7 +20,7 @@ Trace every outbound call Power Automate Desktop (PAD) issues without touching p
    start_pad_trace.bat
    ```
    - Automatically uses `.pad-trace-venv` if it exists, otherwise falls back to `%PYTHON%` or the system `python`.
-   - Default `--process auto` scans for `PAD.Designer.exe`, `PAD.AutomationServer.exe`, `PAD.Robot.exe`, `pad.exe`, etc., and keeps rescanning every few seconds. Add extra names like `powershell.exe` or `cmd.exe` (e.g., `--process auto,powershell.exe,cmd.exe`) when your flows launch external tools that make HTTP calls.
+   - Default `--process auto` scans for the common PAD binaries **plus** helper processes such as `powershell.exe`, `pwsh.exe`, `cmd.exe`, `PAD.Console.Host.exe`, and `msedgewebview2.exe`, and keeps rescanning every few seconds. Add extra names if your flows launch other executables that perform HTTP calls.
    - Hooks both `winhttp.dll` and `wininet.dll` (wide + ANSI exports) inside every attached process so you capture PAD, CMD, PowerShell, or any helper without TLS proxying.
    - Captured calls are written under `pad_full_http_logs/` with complete metadata.
 

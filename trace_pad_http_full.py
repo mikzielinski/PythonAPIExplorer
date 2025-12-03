@@ -33,6 +33,11 @@ DEFAULT_PROCESS_PATTERNS = [
     "pad.automationservice.exe",
     "pad.robot.exe",
     "pad.robotservice.exe",
+    "pad.console.host.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "cmd.exe",
+    "msedgewebview2.exe",
     "pad.*",
 ]
 
